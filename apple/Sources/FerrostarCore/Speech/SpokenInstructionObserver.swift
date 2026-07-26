@@ -29,7 +29,7 @@ public class SpokenInstructionObserver {
     @Published public private(set) var isMuted: Bool
 
     let synthesizer: SpeechSynthesizer
-    private let audioManager = AudioSessionManager()
+    private let audioSession: any AudioSessionControlling
     private let maximumAudioFocusHold: Duration
 
     private struct State {
@@ -37,6 +37,10 @@ public class SpokenInstructionObserver {
         var speechTail: Task<Void, Never>?
         /// The in-flight fallback poll, if any.
         var releaseTask: Task<Void, Never>?
+        /// Our claim on the shared audio session, held from the first utterance until the queue
+        /// drains. At most one at a time: the several paths that can conclude speech is over all
+        /// consume this, so only the first of them actually releases.
+        var audioFocusHold: AudioFocusHold?
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
@@ -55,14 +59,20 @@ public class SpokenInstructionObserver {
     ///     utterance was cut without a completion callback. When it elapses the synthesizer's queue
     ///     is flushed and focus released, so guidance recovers on its own instead of staying silent
     ///     for the rest of the trip.
+    ///   - audioSession: Who owns the `AVAudioSession`. Leave this alone unless your app plays
+    ///     sounds of its own during navigation — in which case pass the *same* instance to those
+    ///     too, so that focus is counted across all of them and nobody deactivates the session
+    ///     while somebody else is still audible. See ``AudioSessionControlling``.
     public init(
         synthesizer: SpeechSynthesizer,
         isMuted: Bool,
-        maximumAudioFocusHold: Duration = .seconds(60)
+        maximumAudioFocusHold: Duration = .seconds(60),
+        audioSession: any AudioSessionControlling = AudioSessionManager.shared
     ) {
         self.synthesizer = synthesizer
         self.isMuted = isMuted
         self.maximumAudioFocusHold = maximumAudioFocusHold
+        self.audioSession = audioSession
 
         if let observable = synthesizer as? any QueueObservableSpeechSynthesizer {
             // Weak, and the synthesizer may outlive us: a dead handler is a no-op.
@@ -86,6 +96,16 @@ public class SpokenInstructionObserver {
             task.cancel()
         }
         // NOTE: The tasks will deinit themselves
+
+        // The session is shared and outlives us; a hold we never released would leave every other
+        // app on the device ducked. `deinit` cannot await, so hand it off.
+        if let hold = state.withLock({ state -> AudioFocusHold? in
+            defer { state.audioFocusHold = nil }
+            return state.audioFocusHold
+        }) {
+            let audioSession = audioSession
+            Task { await audioSession.releaseAudioFocus(hold) }
+        }
     }
 
     public func spokenInstructionTriggered(_ instruction: FerrostarCoreFFI.SpokenInstruction) {
@@ -104,7 +124,7 @@ public class SpokenInstructionObserver {
             let utterance = Self.utterance(for: instruction)
 
             cancelAudioFocusRelease()
-            await audioManager.requestAudioFocus()
+            await acquireAudioFocusIfNeeded()
             synthesizer.speak(utterance)
             scheduleFallbackAudioFocusRelease()
         }
@@ -128,7 +148,7 @@ public class SpokenInstructionObserver {
             guard let self else { return }
 
             synthesizer.stopSpeaking(at: .immediate)
-            await audioManager.releaseAudioFocus()
+            await relinquishAudioFocusHold()
         }
     }
 
@@ -172,6 +192,40 @@ public class SpokenInstructionObserver {
         }
     }
 
+    /// Claims audio focus unless we are already holding it.
+    ///
+    /// Only ever called from inside the serial chain, so the check and the store cannot interleave
+    /// with a release. The redundant-hold branch is belt and braces: leaking a hold on a shared,
+    /// counted session would duck every other app on the device until the process exits.
+    private func acquireAudioFocusIfNeeded() async {
+        guard state.withLock({ $0.audioFocusHold }) == nil else { return }
+
+        let hold = await audioSession.acquireAudioFocus()
+        let redundantHold = state.withLock { state -> AudioFocusHold? in
+            guard state.audioFocusHold == nil else { return hold }
+            state.audioFocusHold = hold
+            return nil
+        }
+
+        if let redundantHold {
+            await audioSession.releaseAudioFocus(redundantHold)
+        }
+    }
+
+    /// Gives back our claim, if we still have one.
+    ///
+    /// Consuming the hold is what makes the several release paths idempotent with respect to each
+    /// other: the drain edge, the fallback poll, the watchdog and an explicit stop can all decide
+    /// speech is over, and whichever gets here first is the one that releases.
+    private func relinquishAudioFocusHold() async {
+        guard let hold = state.withLock({ state -> AudioFocusHold? in
+            defer { state.audioFocusHold = nil }
+            return state.audioFocusHold
+        }) else { return }
+
+        await audioSession.releaseAudioFocus(hold)
+    }
+
     /// Handles the drain edge published by a ``QueueObservableSpeechSynthesizer``.
     private func handleUtteranceQueueDrained() {
         releaseAudioFocus()
@@ -194,7 +248,7 @@ public class SpokenInstructionObserver {
             guard let self, !self.synthesizer.isSpeaking else { return }
 
             cancelAudioFocusRelease()
-            await audioManager.releaseAudioFocus()
+            await relinquishAudioFocusHold()
         }
     }
 
@@ -215,7 +269,7 @@ public class SpokenInstructionObserver {
 
             synthesizer.stopSpeaking(at: .immediate)
             cancelAudioFocusRelease()
-            await audioManager.releaseAudioFocus()
+            await relinquishAudioFocusHold()
         }
     }
 
