@@ -193,6 +193,41 @@ final class SpokenObserverTests: XCTestCase {
         handler?()
     }
 
+    /// A drain edge that lands while audio is still playing must leave the fallback poll armed,
+    /// because the poll is then the only thing that will retry the release.
+    ///
+    /// This pins the ordering of the guard and `cancelAudioFocusRelease()` inside
+    /// `releaseAudioFocus()`, which otherwise reads like a redundant early return. It is
+    /// load-bearing for `stopSpeaking(at: .word)`: that zeroes the queue count without publishing
+    /// a drain edge, so nothing else would ever release focus. Hoist the cancel above the guard
+    /// and this test fails.
+    func test_drainEdgeArrivingWhileStillSpeaking_leavesTheFallbackPollArmed() {
+        let mockSpeechSynthesizer = MockQueueObservableSpeechSynthesizer()
+        // Audio outlives the queue count, exactly as it does after a `.word` boundary stop.
+        mockSpeechSynthesizer.isSpeaking = true
+
+        let spokenObserver = SpokenInstructionObserver(
+            synthesizer: mockSpeechSynthesizer,
+            isMuted: false,
+            maximumAudioFocusHold: .milliseconds(1)
+        )
+
+        let exp = expectation(description: "the fallback poll still fires")
+        exp.assertForOverFulfill = false
+        mockSpeechSynthesizer.onStopSpeaking = { boundary in
+            XCTAssertEqual(boundary, .immediate)
+            exp.fulfill()
+        }
+
+        mockSpeechSynthesizer.onSpeak = { [weak mockSpeechSynthesizer] _ in
+            mockSpeechSynthesizer?.onUtteranceQueueDrained?()
+        }
+
+        spokenObserver.spokenInstructionTriggered(makeInstruction("Turn left"))
+
+        wait(for: [exp], timeout: 10)
+    }
+
     // MARK: - Stalled speech recovery
 
     /// The field failure this whole change exists for: an utterance cut without a completion
