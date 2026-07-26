@@ -157,6 +157,46 @@ Your navigation view can store the spoken instruction observer as an instance va
 
 Then, you'll need to initialize `FerrostarCore` to reference it. As stated above, it has a default parameter to use `AVSpeechSynthesizer`.
 
+#### Playing your own sounds during navigation
+
+If your app plays any other audio while navigating —
+an arrival chime, a rerouting tone —
+do **not** configure or activate `AVAudioSession` yourself.
+`AVAudioSession` belongs to the process, not to any one component,
+so whichever of you deactivates it first cuts off the other.
+When the loser is speech, the utterance is cut without a completion callback
+and all later guidance queues silently behind it.
+
+Instead, share Ferrostar's audio session and let it count the holds:
+
+```swift
+// `AudioSessionManager.shared` is the default, so this is only needed
+// if you construct your own with a different configuration.
+try await AudioSessionManager.shared.withAudioFocus {
+    await chimePlayer.playToCompletion()
+}
+```
+
+The session is activated on the first hold and deactivated only when the last one is released,
+so a chime that overlaps a spoken instruction is safe in either order.
+Anything conforming to `AudioSessionControlling` works here,
+which also makes audio focus straightforward to assert in your own tests.
+
+<div class="warning">
+
+The closure you pass must be **guaranteed to return**, or its hold is never released
+and other apps stay ducked indefinitely.
+
+Watch out for a sound that can retrigger while it is still playing.
+If `playToCompletion()` above is bridged to `async` through a single completion callback
+(such as `AVAudioPlayerDelegate.audioPlayerDidFinishPlaying`),
+and the player restarts itself on a second request rather than queueing,
+then the callback fires only once — at the end of the *second* play —
+and the first continuation never resumes.
+Either serialise the plays, or resume the outgoing continuation when you restart.
+
+</div>
+
 Finally, you can use this to drive state on navigation view.
 `DynamicallyOrientingNavigationView` has constructor arguments to configure the mute button UI.
 See the demo app for an example.

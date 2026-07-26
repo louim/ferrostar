@@ -36,6 +36,62 @@ final class MockQueueObservableSpeechSynthesizer: QueueObservableSpeechSynthesiz
     }
 }
 
+/// Records what the observer does to the shared audio session.
+///
+/// Injecting this is the whole point of `AudioSessionControlling`: before it existed, the
+/// observer owned a private `AudioSessionManager` and nothing about audio focus — the single most
+/// failure-prone part of this file — could be asserted at all.
+final class SpyAudioSession: AudioSessionControlling {
+    private struct State {
+        var acquired: [AudioFocusHold] = []
+        var released: [AudioFocusHold] = []
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    var acquiredCount: Int {
+        state.withLock { $0.acquired.count }
+    }
+
+    var releasedCount: Int {
+        state.withLock { $0.released.count }
+    }
+
+    var hasOutstandingHold: Bool {
+        state.withLock { $0.acquired.count > $0.released.count }
+    }
+
+    /// Every release must correspond to a hold this spy actually issued.
+    var releasedOnlyIssuedHolds: Bool {
+        state.withLock { $0.released.allSatisfy($0.acquired.contains) }
+    }
+
+    var onAcquire: (@Sendable () -> Void)?
+    var onRelease: (@Sendable () -> Void)?
+
+    func acquireAudioFocus() async -> AudioFocusHold {
+        let hold = AudioFocusHold()
+        state.withLock { $0.acquired.append(hold) }
+        onAcquire?()
+        return hold
+    }
+
+    func releaseAudioFocus(_ hold: AudioFocusHold) async {
+        state.withLock { $0.released.append(hold) }
+        onRelease?()
+    }
+}
+
+/// An `AVSpeechSynthesizer` that stays quiet, so tests exercising the convenience factory do not
+/// depend on real synthesis.
+private final class SilentAVSpeechSynthesizer: AVSpeechSynthesizer {
+    override func speak(_: AVSpeechUtterance) {}
+
+    override func stopSpeaking(at _: AVSpeechBoundary) -> Bool {
+        true
+    }
+}
+
 private final class RecordingSpeechDelegate: NSObject, AVSpeechSynthesizerDelegate {
     private(set) var finished: [AVSpeechUtterance] = []
 
@@ -296,5 +352,169 @@ final class SpokenObserverTests: XCTestCase {
         XCTAssertNotNil(tracking, "The default synthesizer must be queue-observable")
         XCTAssertTrue(avSpeechSynthesizer.delegate === tracking, "The wrapper must own the delegate slot")
         XCTAssertTrue(tracking?.forwardingDelegate === hostDelegate, "The host's delegate must be preserved")
+    }
+
+    /// The convenience factory must be able to join a shared session too, otherwise an app that
+    /// uses it has no way to stop its own sounds from fighting Ferrostar's.
+    func test_initAVSpeechSynthesizer_forwardsTheAudioSession() {
+        let spyAudioSession = SpyAudioSession()
+        let spokenObserver = SpokenInstructionObserver.initAVSpeechSynthesizer(
+            synthesizer: SilentAVSpeechSynthesizer(),
+            audioSession: spyAudioSession
+        )
+
+        let exp = expectation(description: "audio focus acquired from the injected session")
+        exp.assertForOverFulfill = false
+        spyAudioSession.onAcquire = { exp.fulfill() }
+
+        spokenObserver.spokenInstructionTriggered(makeInstruction("Turn left"))
+
+        wait(for: [exp], timeout: 10)
+    }
+
+    // MARK: - Audio focus
+
+    /// Guidance is a single continuous claim, not one per instruction. Acquiring repeatedly would
+    /// leave holds outstanding that nothing ever releases, ducking every other app indefinitely.
+    func test_consecutiveInstructionsShareOneAudioFocusHold() {
+        let mockSpeechSynthesizer = MockSpeechSynthesizer()
+        let spyAudioSession = SpyAudioSession()
+        let spokenObserver = SpokenInstructionObserver(
+            synthesizer: mockSpeechSynthesizer,
+            isMuted: false,
+            audioSession: spyAudioSession
+        )
+
+        let exp = expectation(description: "all instructions spoken")
+        let spokenCount = OSAllocatedUnfairLock(initialState: 0)
+        mockSpeechSynthesizer.onSpeak = { _ in
+            let isComplete = spokenCount.withLock { count -> Bool in
+                count += 1
+                return count == 3
+            }
+            if isComplete {
+                exp.fulfill()
+            }
+        }
+
+        // Still "speaking" throughout, so nothing concludes the queue has drained.
+        mockSpeechSynthesizer.isSpeaking = true
+        for text in ["One", "Two", "Three"] {
+            spokenObserver.spokenInstructionTriggered(makeInstruction(text))
+        }
+
+        wait(for: [exp], timeout: 10)
+        XCTAssertEqual(spyAudioSession.acquiredCount, 1)
+        XCTAssertEqual(spyAudioSession.releasedCount, 0)
+    }
+
+    func test_audioFocusIsReleasedOnTheDrainEdge() {
+        let mockSpeechSynthesizer = MockQueueObservableSpeechSynthesizer()
+        let spyAudioSession = SpyAudioSession()
+        let spokenObserver = SpokenInstructionObserver(
+            synthesizer: mockSpeechSynthesizer,
+            isMuted: false,
+            audioSession: spyAudioSession
+        )
+
+        let exp = expectation(description: "audio focus released")
+        spyAudioSession.onRelease = { exp.fulfill() }
+
+        mockSpeechSynthesizer.onSpeak = { [weak mockSpeechSynthesizer] _ in
+            // The queue drained; the synthesizer is genuinely idle now.
+            mockSpeechSynthesizer?.isSpeaking = false
+            mockSpeechSynthesizer?.onUtteranceQueueDrained?()
+        }
+
+        spokenObserver.spokenInstructionTriggered(makeInstruction("Turn left"))
+
+        wait(for: [exp], timeout: 10)
+        XCTAssertEqual(spyAudioSession.acquiredCount, 1)
+        XCTAssertEqual(spyAudioSession.releasedCount, 1)
+        XCTAssertTrue(spyAudioSession.releasedOnlyIssuedHolds)
+        XCTAssertFalse(spyAudioSession.hasOutstandingHold)
+    }
+
+    /// The failure this whole area exists to prevent: releasing focus deactivates the session, and
+    /// doing that under a live utterance cuts it without a completion callback.
+    func test_audioFocusIsNotReleasedWhileStillSpeaking() {
+        let mockSpeechSynthesizer = MockQueueObservableSpeechSynthesizer()
+        // Audio is still playing when the edge arrives.
+        mockSpeechSynthesizer.isSpeaking = true
+
+        let spyAudioSession = SpyAudioSession()
+        let spokenObserver = SpokenInstructionObserver(
+            synthesizer: mockSpeechSynthesizer,
+            isMuted: false,
+            // Long enough that the watchdog cannot confound this.
+            maximumAudioFocusHold: .seconds(600),
+            audioSession: spyAudioSession
+        )
+
+        let exp = expectation(description: "instruction spoken")
+        mockSpeechSynthesizer.onSpeak = { [weak mockSpeechSynthesizer] _ in
+            mockSpeechSynthesizer?.onUtteranceQueueDrained?()
+            exp.fulfill()
+        }
+
+        spokenObserver.spokenInstructionTriggered(makeInstruction("Turn left"))
+        wait(for: [exp], timeout: 10)
+
+        // Outlive several fallback poll ticks; a premature release would land in this window.
+        Thread.sleep(forTimeInterval: 2)
+
+        XCTAssertEqual(spyAudioSession.acquiredCount, 1)
+        XCTAssertEqual(spyAudioSession.releasedCount, 0, "Releasing here would cut the live utterance")
+    }
+
+    func test_stalledSpeechRecoveryReleasesAudioFocus() {
+        let mockSpeechSynthesizer = MockSpeechSynthesizer()
+        // Never stops, exactly as a wedged AVSpeechSynthesizer behaves.
+        mockSpeechSynthesizer.isSpeaking = true
+
+        let spyAudioSession = SpyAudioSession()
+        let spokenObserver = SpokenInstructionObserver(
+            synthesizer: mockSpeechSynthesizer,
+            isMuted: false,
+            maximumAudioFocusHold: .milliseconds(1),
+            audioSession: spyAudioSession
+        )
+
+        let exp = expectation(description: "audio focus released")
+        exp.assertForOverFulfill = false
+        spyAudioSession.onRelease = { exp.fulfill() }
+
+        spokenObserver.spokenInstructionTriggered(makeInstruction("Turn left"))
+
+        wait(for: [exp], timeout: 10)
+        XCTAssertTrue(spyAudioSession.releasedOnlyIssuedHolds)
+        XCTAssertFalse(spyAudioSession.hasOutstandingHold)
+    }
+
+    func test_stopAndClearQueueReleasesAudioFocus() {
+        let mockSpeechSynthesizer = MockSpeechSynthesizer()
+        mockSpeechSynthesizer.isSpeaking = true
+
+        let spyAudioSession = SpyAudioSession()
+        let spokenObserver = SpokenInstructionObserver(
+            synthesizer: mockSpeechSynthesizer,
+            isMuted: false,
+            maximumAudioFocusHold: .seconds(600),
+            audioSession: spyAudioSession
+        )
+
+        let spoken = expectation(description: "instruction spoken")
+        mockSpeechSynthesizer.onSpeak = { _ in spoken.fulfill() }
+        spokenObserver.spokenInstructionTriggered(makeInstruction("Turn left"))
+        wait(for: [spoken], timeout: 10)
+
+        let released = expectation(description: "audio focus released")
+        released.assertForOverFulfill = false
+        spyAudioSession.onRelease = { released.fulfill() }
+
+        spokenObserver.stopAndClearQueue()
+
+        wait(for: [released], timeout: 10)
+        XCTAssertFalse(spyAudioSession.hasOutstandingHold)
     }
 }
