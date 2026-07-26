@@ -338,13 +338,18 @@ public extension SpokenInstructionObserver {
     ///    - synthesizer: An instance of AVSpeechSynthesizer. One is provided by default, but you can inject your own.
     ///    - isMuted: If the synthesizer is muted. This should be false unless you're providing a "hot" synth that is
     /// speaking.
+    ///    - audioSession: Who owns the `AVAudioSession`. Pass the same instance you give to any
+    /// other sound your app plays during navigation, so that focus is counted across all of them.
     /// - Returns: The instance of SpokenInstructionObserver
-    static func initAVSpeechSynthesizer(synthesizer: AVSpeechSynthesizer = AVSpeechSynthesizer(),
-                                        isMuted: Bool = false) -> SpokenInstructionObserver
-    {
+    static func initAVSpeechSynthesizer(
+        synthesizer: AVSpeechSynthesizer = AVSpeechSynthesizer(),
+        isMuted: Bool = false,
+        audioSession: any AudioSessionControlling = AudioSessionManager.shared
+    ) -> SpokenInstructionObserver {
         SpokenInstructionObserver(
             synthesizer: QueueTrackingSpeechSynthesizer(synthesizer: synthesizer),
-            isMuted: isMuted
+            isMuted: isMuted,
+            audioSession: audioSession
         )
     }
 }

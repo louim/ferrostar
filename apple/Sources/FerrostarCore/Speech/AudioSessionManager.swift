@@ -71,6 +71,19 @@ public extension AudioSessionControlling {
     ///
     /// The hold is released whether `body` returns or throws,
     /// which is why this should be preferred over the primitives wherever the shape allows it.
+    ///
+    /// - Important: `body` must be *guaranteed* to return.
+    /// A body that never completes holds focus forever,
+    /// and this cannot defend against that —
+    /// a body that will never return is indistinguishable from one that is still working.
+    ///
+    /// The usual way to get this wrong is a retriggerable sound
+    /// bridged to `async` through a single completion callback.
+    /// If a player restarts itself while already playing
+    /// (`currentTime = 0; play()`) and the completion callback fires only once,
+    /// the *first* continuation never resumes and its hold is never released —
+    /// which leaves every other app on the device ducked.
+    /// Either serialise the plays, or resume the outgoing continuation when restarting.
     func withAudioFocus<T>(_ body: () async throws -> T) async rethrows -> T {
         let hold = await acquireAudioFocus()
 
@@ -104,6 +117,22 @@ protocol AudioSessionHandle: Sendable {
 extension AVAudioSession: AudioSessionHandle {}
 
 /// The default ``AudioSessionControlling``.
+///
+/// ## Known limitation: system interruptions
+///
+/// This type does not yet observe `AVAudioSession.interruptionNotification`.
+/// When the system interrupts the session — an incoming phone call is the everyday case —
+/// it deactivates the session underneath us,
+/// but the outstanding holds are unaffected,
+/// so the count still believes the session is active.
+/// Nothing re-activates it when the interruption ends:
+/// the next ``acquireAudioFocus()`` sees a non-empty set and skips activation,
+/// and ducking is not re-established until every hold drains and a fresh one is taken.
+///
+/// Recovering properly means separating "holds outstanding" from "session is active",
+/// which is a change to the state model rather than an addition to it,
+/// so it is deliberately left out of this change.
+/// The behaviour is not a regression — the boolean latch this replaced had the same blind spot.
 ///
 /// Because `AVAudioSession` is process-wide, so is the count that guards it:
 /// use ``shared`` unless you are writing a test.
