@@ -156,6 +156,12 @@ public class SpokenInstructionObserver {
     ///
     /// Awaiting the previous task (rather than spawning freely) is what provides the ordering;
     /// the lock only makes the swap of the tail itself atomic.
+    ///
+    /// Because of that, calling this from *inside* a work item is safe and not a deadlock, even
+    /// though it looks like one: the lock is never held while a work item runs. That path is real
+    /// — `stopAndClearQueue()` calls `stopSpeaking(at:)`, which makes a
+    /// ``QueueObservableSpeechSynthesizer`` publish a drain edge synchronously, which lands back
+    /// here. The re-entrant item simply queues behind the one that triggered it.
     private func enqueueSerially(_ work: @escaping @Sendable () async -> Void) {
         state.withLock { state in
             let previous = state.speechTail
@@ -178,6 +184,11 @@ public class SpokenInstructionObserver {
     /// through the same serial chain as the speech itself and the "is it still speaking?" question
     /// is asked again from inside it. Deactivating the session under a live utterance is precisely
     /// what cuts the utterance without a completion callback and wedges all later guidance.
+    ///
+    /// Note the ordering of the guard and ``cancelAudioFocusRelease()``: bailing out because
+    /// speech is still in progress deliberately leaves the fallback poll running, since it is now
+    /// the only thing that will retry. This is load-bearing for `stopSpeaking(at: .word)`, which
+    /// zeroes the queue count without publishing a drain edge.
     private func releaseAudioFocus() {
         enqueueSerially { [weak self] in
             guard let self, !self.synthesizer.isSpeaking else { return }
