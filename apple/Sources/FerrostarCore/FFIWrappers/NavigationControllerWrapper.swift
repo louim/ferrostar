@@ -19,5 +19,14 @@ public struct SwiftNavigationControllerConfig {
         )
     }
 
-    var ffiValue: FerrostarCoreFFI.NavigationControllerConfig
+    /// The underlying FFI configuration.
+    ///
+    /// Exposed so that host applications can hand the same configuration to other FFI entry
+    /// points without rebuilding it by hand. Keeping a second, hand-assembled
+    /// `NavigationControllerConfig` in sync with this one is a silent drift hazard: nothing
+    /// enforces that the two literals agree, and a mismatch shows up as navigation behaving
+    /// differently depending on which path constructed the config.
+    ///
+    /// Read-only, so that the typed initialiser above remains the only way to build one.
+    public private(set) var ffiValue: FerrostarCoreFFI.NavigationControllerConfig
 }
