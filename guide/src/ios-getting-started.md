@@ -137,6 +137,18 @@ and you can build your own implementation on this,
 such as a local AI model or cloud service like Amazon Polly.
 PRs welcome to add other publicly accessible speech API implementations.
 
+If you write your own,
+also conform it to `QueueObservableSpeechSynthesizer`.
+Ferrostar holds audio focus (ducking other apps) only while it is speaking,
+and that protocol is how a synthesizer says "my queue is empty now."
+Without it Ferrostar has to poll `isSpeaking`,
+which reports `false` in the gap between two chained utterances —
+and releasing the audio session mid-utterance cuts the utterance
+without delivering a completion callback,
+which can silence guidance for the rest of the trip.
+The built-in `QueueTrackingSpeechSynthesizer` wraps an `AVSpeechSynthesizer` to do this,
+preserving any delegate you had already installed on it.
+
 Your navigation view can store the spoken instruction observer as an instance variable:
 
 ```swift
