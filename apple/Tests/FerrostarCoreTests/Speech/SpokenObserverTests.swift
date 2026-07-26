@@ -66,17 +66,29 @@ final class SpyAudioSession: AudioSessionControlling {
         state.withLock { $0.released.allSatisfy($0.acquired.contains) }
     }
 
+    var onAcquire: (@Sendable () -> Void)?
     var onRelease: (@Sendable () -> Void)?
 
     func acquireAudioFocus() async -> AudioFocusHold {
         let hold = AudioFocusHold()
         state.withLock { $0.acquired.append(hold) }
+        onAcquire?()
         return hold
     }
 
     func releaseAudioFocus(_ hold: AudioFocusHold) async {
         state.withLock { $0.released.append(hold) }
         onRelease?()
+    }
+}
+
+/// An `AVSpeechSynthesizer` that stays quiet, so tests exercising the convenience factory do not
+/// depend on real synthesis.
+private final class SilentAVSpeechSynthesizer: AVSpeechSynthesizer {
+    override func speak(_: AVSpeechUtterance) {}
+
+    override func stopSpeaking(at _: AVSpeechBoundary) -> Bool {
+        true
     }
 }
 
@@ -340,6 +352,24 @@ final class SpokenObserverTests: XCTestCase {
         XCTAssertNotNil(tracking, "The default synthesizer must be queue-observable")
         XCTAssertTrue(avSpeechSynthesizer.delegate === tracking, "The wrapper must own the delegate slot")
         XCTAssertTrue(tracking?.forwardingDelegate === hostDelegate, "The host's delegate must be preserved")
+    }
+
+    /// The convenience factory must be able to join a shared session too, otherwise an app that
+    /// uses it has no way to stop its own sounds from fighting Ferrostar's.
+    func test_initAVSpeechSynthesizer_forwardsTheAudioSession() {
+        let spyAudioSession = SpyAudioSession()
+        let spokenObserver = SpokenInstructionObserver.initAVSpeechSynthesizer(
+            synthesizer: SilentAVSpeechSynthesizer(),
+            audioSession: spyAudioSession
+        )
+
+        let exp = expectation(description: "audio focus acquired from the injected session")
+        exp.assertForOverFulfill = false
+        spyAudioSession.onAcquire = { exp.fulfill() }
+
+        spokenObserver.spokenInstructionTriggered(makeInstruction("Turn left"))
+
+        wait(for: [exp], timeout: 10)
     }
 
     // MARK: - Audio focus
