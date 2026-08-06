@@ -118,21 +118,24 @@ extension AVAudioSession: AudioSessionHandle {}
 
 /// The default ``AudioSessionControlling``.
 ///
-/// ## Known limitation: system interruptions
+/// ## System interruptions and media services resets
 ///
-/// This type does not yet observe `AVAudioSession.interruptionNotification`.
-/// When the system interrupts the session — an incoming phone call is the everyday case —
-/// it deactivates the session underneath us,
-/// but the outstanding holds are unaffected,
-/// so the count still believes the session is active.
-/// Nothing re-activates it when the interruption ends:
-/// the next ``acquireAudioFocus()`` sees a non-empty set and skips activation,
-/// and ducking is not re-established until every hold drains and a fresh one is taken.
+/// "Holds outstanding" and "the session is active" are tracked separately,
+/// because the system can split them at any moment:
+/// an interruption (phone call, dictation) deactivates the session underneath us,
+/// and a media services reset (the audio server crashing) discards it wholesale —
+/// in both cases without consuming any holds.
+/// The manager observes `AVAudioSession.interruptionNotification` and
+/// `AVAudioSession.mediaServicesWereResetNotification`
+/// and re-activates — full configuration included — while holds are outstanding,
+/// so guidance mid-trip survives both.
 ///
-/// Recovering properly means separating "holds outstanding" from "session is active",
-/// which is a change to the state model rather than an addition to it,
-/// so it is deliberately left out of this change.
-/// The behaviour is not a regression — the boolean latch this replaced had the same blind spot.
+/// A failed activation likewise leaves the session marked inactive,
+/// so the next acquire retries instead of trusting a success that never happened.
+/// This is not hypothetical:
+/// an audio server crash mid-navigation has been observed to wedge the conflated state —
+/// the session was never reconfigured nor released,
+/// and every other app on the device stayed ducked until the process was killed.
 ///
 /// Because `AVAudioSession` is process-wide, so is the count that guards it:
 /// use ``shared`` unless you are writing a test.
@@ -181,13 +184,41 @@ public actor AudioSessionManager: AudioSessionControlling {
     /// or a release of a hold from a previous trip, cannot silently decrement somebody else's.
     private var holds: Set<AudioFocusHold> = []
 
+    /// Whether *our* activation of the session is currently in effect.
+    ///
+    /// Deliberately separate from `holds`: the two disagree whenever activation fails
+    /// (the hold is real, the session is not ours)
+    /// or the system deactivates the session underneath us.
+    /// Conflating them is what wedges a whole trip after an audio server crash —
+    /// a non-empty `holds` makes every later acquire skip activation,
+    /// and the session is never configured nor released again.
+    private var isSessionActive = false
+
+    /// Tokens for the system notifications above, kept so they can be handed back on deinit.
+    /// Empty until the first acquire: registration is lazy so that test instances,
+    /// which drive the handlers directly, never couple themselves to the process-wide center.
+    private var notificationTokens: [NSObjectProtocol] = []
+
+    /// Whether this instance recovers from system interruptions and media services resets.
+    /// True for the real session; false for test instances over a fake handle.
+    private let observesSystemNotifications: Bool
+
     public init(configuration: Configuration = .navigationVoiceGuidance) {
-        self.init(configuration: configuration, session: AVAudioSession.sharedInstance())
+        self.init(
+            configuration: configuration,
+            session: AVAudioSession.sharedInstance(),
+            observesSystemNotifications: true
+        )
     }
 
-    init(configuration: Configuration = .navigationVoiceGuidance, session: AudioSessionHandle) {
+    init(
+        configuration: Configuration = .navigationVoiceGuidance,
+        session: AudioSessionHandle,
+        observesSystemNotifications: Bool = false
+    ) {
         self.configuration = configuration
         self.session = session
+        self.observesSystemNotifications = observesSystemNotifications
     }
 
     /// Whether the session is currently active on our behalf.
@@ -196,11 +227,15 @@ public actor AudioSessionManager: AudioSessionControlling {
     }
 
     public func acquireAudioFocus() -> AudioFocusHold {
+        startObservingSystemNotificationsIfNeeded()
+
         let hold = AudioFocusHold()
-        let wasInactive = holds.isEmpty
         holds.insert(hold)
 
-        if wasInactive {
+        // Keyed on the session's state, not on whether this is the first hold:
+        // a failed activation must be retried by the next acquire,
+        // not remembered as success by everyone after it.
+        if !isSessionActive {
             activate()
         }
 
@@ -212,7 +247,10 @@ public actor AudioSessionManager: AudioSessionControlling {
         // paths that can each conclude speech is finished, and only the first should count.
         guard holds.remove(hold) != nil else { return }
 
-        if holds.isEmpty {
+        // If activation never succeeded (or the system took the session from us),
+        // there is nothing of ours to release, and a blind `setActive(false)` here
+        // would be a write to a session somebody else may be driving.
+        if holds.isEmpty, isSessionActive {
             deactivate()
         }
     }
@@ -228,12 +266,17 @@ public actor AudioSessionManager: AudioSessionControlling {
                 options: configuration.options
             )
             try session.setActive(true, options: [])
+            isSessionActive = true
         } catch {
             logger.error("Failed to configure audio session: \(error.localizedDescription)")
         }
     }
 
     private func deactivate() {
+        // Marked inactive even if the release call throws: the session handle is then in an
+        // unknown state, and treating it as inactive means the next acquire re-applies the full
+        // configuration rather than trusting whatever was left behind.
+        isSessionActive = false
         do {
             try session.setActive(false, options: .notifyOthersOnDeactivation)
         } catch {
@@ -241,8 +284,68 @@ public actor AudioSessionManager: AudioSessionControlling {
         }
     }
 
-    deinit {
+    /// Catches the bookkeeping up with a system event that changed the session behind our back.
+    ///
+    /// Internal so tests can drive the state machine deterministically;
+    /// production traffic arrives via the notification observers.
+    func handleAudioSessionInterruption(type: AVAudioSession.InterruptionType) {
+        switch type {
+        case .began:
+            // The system already deactivated the session; only the bookkeeping needs to catch up.
+            // The holds are untouched on purpose — the sounds they belong to are still in flight,
+            // and their releases are what eventually let the session go once it is ours again.
+            isSessionActive = false
+        case .ended:
+            if !holds.isEmpty, !isSessionActive {
+                activate()
+            }
+        @unknown default:
+            break
+        }
+    }
+
+    /// Handles the audio server having crashed and restarted (`mediaServicesWereResetNotification`).
+    ///
+    /// Everything server-side — including our category and activation — is gone,
+    /// so if anybody still holds focus the full configuration is re-applied on the spot.
+    /// Waiting for the next acquire is not enough:
+    /// a synthesizer speaking on its own re-activates the session implicitly
+    /// with whatever stale category the reset left behind.
+    func handleMediaServicesReset() {
+        isSessionActive = false
         if !holds.isEmpty {
+            activate()
+        }
+    }
+
+    private func startObservingSystemNotificationsIfNeeded() {
+        guard observesSystemNotifications, notificationTokens.isEmpty else { return }
+
+        let center = NotificationCenter.default
+        notificationTokens = [
+            center.addObserver(
+                forName: AVAudioSession.interruptionNotification, object: nil, queue: nil
+            ) { [weak self] notification in
+                guard let self,
+                      let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                      let type = AVAudioSession.InterruptionType(rawValue: rawType)
+                else { return }
+                Task { await self.handleAudioSessionInterruption(type: type) }
+            },
+            center.addObserver(
+                forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: nil
+            ) { [weak self] _ in
+                guard let self else { return }
+                Task { await self.handleMediaServicesReset() }
+            },
+        ]
+    }
+
+    deinit {
+        for token in notificationTokens {
+            NotificationCenter.default.removeObserver(token)
+        }
+        if isSessionActive {
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
         }
     }

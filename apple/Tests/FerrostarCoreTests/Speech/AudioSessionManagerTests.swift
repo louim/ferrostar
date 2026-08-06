@@ -14,10 +14,24 @@ private final class FakeAudioSessionHandle: AudioSessionHandle {
         case setActive(Bool, AVAudioSession.SetActiveOptions)
     }
 
-    private let state = OSAllocatedUnfairLock(initialState: [Call]())
+    struct ActivationRefused: Error {}
+
+    private struct State {
+        var calls: [Call] = []
+        /// While `true`, `setActive(true)` throws — the real session does this when
+        /// the system refuses activation, e.g. during an interruption.
+        var refusesActivation = false
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
 
     var calls: [Call] {
-        state.withLock { $0 }
+        state.withLock { $0.calls }
+    }
+
+    var refusesActivation: Bool {
+        get { state.withLock { $0.refusesActivation } }
+        set { state.withLock { $0.refusesActivation = newValue } }
     }
 
     func setCategory(
@@ -25,11 +39,17 @@ private final class FakeAudioSessionHandle: AudioSessionHandle {
         mode: AVAudioSession.Mode,
         options: AVAudioSession.CategoryOptions
     ) throws {
-        state.withLock { $0.append(.setCategory(category, mode, options)) }
+        state.withLock { $0.calls.append(.setCategory(category, mode, options)) }
     }
 
     func setActive(_ active: Bool, options: AVAudioSession.SetActiveOptions) throws {
-        state.withLock { $0.append(.setActive(active, options)) }
+        let refused = state.withLock { state -> Bool in
+            state.calls.append(.setActive(active, options))
+            return active && state.refusesActivation
+        }
+        if refused {
+            throw ActivationRefused()
+        }
     }
 }
 
@@ -167,6 +187,121 @@ final class AudioSessionManagerTests: XCTestCase {
             .setCategory(.playback, .voicePrompt, [.duckOthers, .interruptSpokenAudioAndMixWithOthers]),
             .setActive(true, []),
         ])
+    }
+
+    // MARK: - Activation failure
+
+    /// Activation can throw — most plainly while the audio server is restarting — and the hold
+    /// count must not remember that as success: with "first hold activates" bookkeeping, no later
+    /// acquire ever tries again and guidance plays into a dead session for the rest of the trip.
+    /// A failed activation must leave the manager knowing the session is NOT active, so the next
+    /// acquire retries instead of skipping.
+    func test_failedActivation_isRetriedOnTheNextAcquire() async {
+        session.refusesActivation = true
+        let first = await subject.acquireAudioFocus()
+
+        session.refusesActivation = false
+        _ = await subject.acquireAudioFocus()
+
+        XCTAssertEqual(session.calls, [
+            .setCategory(.playback, .voicePrompt, [.duckOthers, .interruptSpokenAudioAndMixWithOthers]),
+            .setActive(true, []),
+            .setCategory(.playback, .voicePrompt, [.duckOthers, .interruptSpokenAudioAndMixWithOthers]),
+            .setActive(true, []),
+        ])
+
+        // Both holds are real regardless of the failed first attempt.
+        await subject.releaseAudioFocus(first)
+        let hasAudioFocus = await subject.hasAudioFocus
+        XCTAssertTrue(hasAudioFocus)
+    }
+
+    /// If activation never succeeded, there is nothing to deactivate: calling `setActive(false)`
+    /// on a session somebody else controls is exactly the kind of blind write this manager
+    /// exists to prevent.
+    func test_releaseAfterFailedActivation_doesNotDeactivate() async {
+        session.refusesActivation = true
+        let hold = await subject.acquireAudioFocus()
+
+        await subject.releaseAudioFocus(hold)
+
+        XCTAssertFalse(session.calls.contains(.setActive(false, .notifyOthersOnDeactivation)))
+    }
+
+    // MARK: - System interruptions and media services reset
+
+    /// A system interruption (phone call, dictation) deactivates the session underneath us
+    /// without touching the holds. When it ends, guidance is still mid-trip — the session must
+    /// come back, full configuration included, or every later sound plays into a dead session.
+    func test_interruptionEnded_reactivatesWhileHoldsOutstanding() async {
+        _ = await subject.acquireAudioFocus()
+        let callsBeforeInterruption = session.calls
+
+        await subject.handleAudioSessionInterruption(type: .began)
+        XCTAssertEqual(session.calls, callsBeforeInterruption, "Nothing to do; the system already deactivated us")
+
+        await subject.handleAudioSessionInterruption(type: .ended)
+
+        XCTAssertEqual(session.calls, callsBeforeInterruption + [
+            .setCategory(.playback, .voicePrompt, [.duckOthers, .interruptSpokenAudioAndMixWithOthers]),
+            .setActive(true, []),
+        ])
+    }
+
+    func test_interruption_withNoHolds_doesNotTouchTheSession() async {
+        await subject.handleAudioSessionInterruption(type: .began)
+        await subject.handleAudioSessionInterruption(type: .ended)
+
+        XCTAssertEqual(session.calls, [])
+    }
+
+    /// After the system deactivates us, the last release has nothing of ours to give back —
+    /// and must not blindly write to a session another app may now be driving.
+    func test_releaseAfterSystemDeactivation_doesNotDeactivate() async {
+        let hold = await subject.acquireAudioFocus()
+        await subject.handleAudioSessionInterruption(type: .began)
+
+        await subject.releaseAudioFocus(hold)
+
+        XCTAssertFalse(session.calls.contains(.setActive(false, .notifyOthersOnDeactivation)))
+    }
+
+    /// The system may refuse activation while the interrupting audio still owns the route —
+    /// a hold taken in that window must not be stranded; interruption end retries for it.
+    func test_activationRefusedDuringInterruption_isRecoveredOnInterruptionEnd() async {
+        await subject.handleAudioSessionInterruption(type: .began)
+        session.refusesActivation = true
+        _ = await subject.acquireAudioFocus()
+
+        session.refusesActivation = false
+        await subject.handleAudioSessionInterruption(type: .ended)
+
+        XCTAssertEqual(session.calls.suffix(2), [
+            .setCategory(.playback, .voicePrompt, [.duckOthers, .interruptSpokenAudioAndMixWithOthers]),
+            .setActive(true, []),
+        ])
+    }
+
+    /// The audio server crashing mid-trip evaporates every server-side resource. If the session
+    /// is never reconfigured, later speech re-activates it implicitly with `.duckOthers` latched,
+    /// ducking every other app until the process is killed. After a reset, the full configuration
+    /// must be re-applied on the spot.
+    func test_mediaServicesReset_reappliesConfigurationWhileHoldsOutstanding() async {
+        _ = await subject.acquireAudioFocus()
+        let callsBeforeReset = session.calls
+
+        await subject.handleMediaServicesReset()
+
+        XCTAssertEqual(session.calls, callsBeforeReset + [
+            .setCategory(.playback, .voicePrompt, [.duckOthers, .interruptSpokenAudioAndMixWithOthers]),
+            .setActive(true, []),
+        ])
+    }
+
+    func test_mediaServicesReset_withNoHolds_doesNotTouchTheSession() async {
+        await subject.handleMediaServicesReset()
+
+        XCTAssertEqual(session.calls, [])
     }
 
     // MARK: - Scoped form
