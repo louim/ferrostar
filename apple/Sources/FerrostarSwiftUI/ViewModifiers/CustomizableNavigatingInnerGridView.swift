@@ -126,6 +126,16 @@ public extension View {
     ///   - bottomLeading: The bottom leading view content.
     ///   - bottomTrailing: The bottom trailing view content.
     /// - Returns: A modified view with inner grid configuration in the environment.
+    /// Pass an existing inner grid configuration through unchanged.
+    ///
+    /// Views that host a navigating grid and forward their environment's
+    /// configuration should use this rather than the closure-based modifier:
+    /// that one always sets every slot, so a slot left unset by the app comes
+    /// through as a configured `Spacer`.
+    func navigationViewInnerGrid(_ configuration: NavigationInnerGridConfiguration) -> some View {
+        environment(\.navigationInnerGridConfiguration, configuration)
+    }
+
     @available(*, deprecated, renamed: "navigationViewInnerGrid")
     func innerGrid(
         @ViewBuilder topCenter: @escaping () -> some View = { Spacer() },

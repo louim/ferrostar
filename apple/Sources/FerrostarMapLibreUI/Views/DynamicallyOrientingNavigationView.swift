@@ -104,17 +104,7 @@ public struct DynamicallyOrientingNavigationView: View {
                         cameraControlState: cameraControlState,
                         onTapExit: onTapExit
                     )
-                    .navigationViewInnerGrid {
-                        gridConfig.getTopCenter()
-                    } topTrailing: {
-                        gridConfig.getTopTrailing()
-                    } midLeading: {
-                        gridConfig.getMidLeading()
-                    } bottomLeading: {
-                        gridConfig.getBottomLeading()
-                    } bottomTrailing: {
-                        gridConfig.getBottomTrailing()
-                    }.complementSafeAreaInsets(parentGeometry: geometry, minimumInsets: minimumSafeAreaInsets)
+                    .navigationViewInnerGrid(gridConfig).complementSafeAreaInsets(parentGeometry: geometry, minimumInsets: minimumSafeAreaInsets)
                 } else {
                     PortraitNavigationOverlayView(
                         navigationState: navigationState,
@@ -129,17 +119,7 @@ public struct DynamicallyOrientingNavigationView: View {
                         cameraControlState: cameraControlState,
                         onTapExit: onTapExit
                     )
-                    .navigationViewInnerGrid {
-                        gridConfig.getTopCenter()
-                    } topTrailing: {
-                        gridConfig.getTopTrailing()
-                    } midLeading: {
-                        gridConfig.getMidLeading()
-                    } bottomLeading: {
-                        gridConfig.getBottomLeading()
-                    } bottomTrailing: {
-                        gridConfig.getBottomTrailing()
-                    }.complementSafeAreaInsets(parentGeometry: geometry, minimumInsets: minimumSafeAreaInsets)
+                    .navigationViewInnerGrid(gridConfig).complementSafeAreaInsets(parentGeometry: geometry, minimumInsets: minimumSafeAreaInsets)
                 }
             }
         }

@@ -78,17 +78,7 @@ struct PortraitNavigationOverlayView: View {
                     onZoomOut: onZoomOut,
                     cameraControlState: cameraControlState
                 )
-                .navigationViewInnerGrid {
-                    gridConfig.getTopCenter()
-                } topTrailing: {
-                    gridConfig.getTopTrailing()
-                } midLeading: {
-                    gridConfig.getMidLeading()
-                } bottomLeading: {
-                    gridConfig.getBottomLeading()
-                } bottomTrailing: {
-                    gridConfig.getBottomTrailing()
-                }
+                .navigationViewInnerGrid(gridConfig)
 
                 if case .navigating = navigationState?.tripState {
                     VStack {
