@@ -77,6 +77,12 @@ public struct NavigatingInnerGridView: View {
                 if showMute {
                     NavigationUIMuteButton(isMuted: isMuted, action: onMute)
                 }
+
+                // A configured top trailing view stacks below the built-in
+                // controls rather than replacing them.
+                if let topTrailing = gridConfig.topTrailing {
+                    topTrailing()
+                }
             },
             midLeading: { gridConfig.getMidLeading() },
             midCenter: {
