@@ -100,17 +100,7 @@ public struct PortraitNavigationView: View {
                     cameraControlState: cameraControlState,
                     onTapExit: onTapExit
                 )
-                .navigationViewInnerGrid {
-                    gridConfig.getTopCenter()
-                } topTrailing: {
-                    gridConfig.getTopTrailing()
-                } midLeading: {
-                    gridConfig.getMidLeading()
-                } bottomLeading: {
-                    gridConfig.getBottomLeading()
-                } bottomTrailing: {
-                    gridConfig.getBottomTrailing()
-                }
+                .navigationViewInnerGrid(gridConfig)
                 .complementSafeAreaInsets(parentGeometry: geometry, minimumInsets: minimumSafeAreaInsets)
             }
         }
